@@ -1,4 +1,3 @@
-# src/assistants.py
 import os
 from datetime import datetime
 
@@ -23,11 +22,9 @@ from .tools import (
 load_dotenv()
 import pandas as pd
 
-# Setup LLM
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY") or "Empty"
-llm = ChatOpenAI(model = 'gpt-4o', api_key=OPENAI_API_KEY)
+llm = ChatOpenAI(model="gpt-4o", api_key=OPENAI_API_KEY)
 
-# Tool registration
 sales_tools = [
     RouteToCustomerSupport,
     search_tool,
@@ -37,7 +34,6 @@ sales_tools = [
 ]
 support_tools = [EscalateToHuman]
 
-# Runnable pipelines
 sales_runnable = sales_rep_prompt.partial(time=datetime.now) | llm.bind_tools(
     sales_tools
 )
@@ -45,33 +41,15 @@ support_runnable = support_prompt.partial(time=datetime.now) | llm.bind_tools(
     support_tools
 )
 
-# TODO
-def sales_assistant(state: State, config: RunnableConfig, runnable=sales_runnable) -> dict:
-    """
-    LangGraph node function for running the sales assistant LLM agent.
 
-    This function binds a chat prompt (`sales_rep_prompt`) with tools and invokes
-    the LangChain Runnable pipeline. It sets the thread and user IDs and runs the
-    agent with the given state and config.
-
-    ---
-    Arguments:
-    - state (State): LangGraph state with current dialog history.
-    - config (RunnableConfig): Config object that contains the `thread_id`.
-    - runnable: (optional) The runnable to use; defaults to global `sales_runnable`.
-
-    ---
-    Behavior:
-    - Extract thread ID from config and set it using `set_thread_id(...)`.
-    - Set default user ID via `set_user_id(...)`.
-    - Use the given `runnable` to run the assistant logic.
-
-    ---
-    Returns:
-    - A dictionary with a `"messages"` key containing the new AI message(s).
-    Example: `{"messages": [AIMessage(...)]}`
-    """
-    pass
+async def sales_assistant(
+    state: State, config: RunnableConfig, runnable=sales_runnable
+) -> dict:
+    """Sales assistant that handles product queries and cart operations."""
+    set_thread_id(config["configurable"]["thread_id"])
+    set_user_id(DEFAULT_USER_ID)
+    response = await runnable.ainvoke(state, config=config)
+    return {"messages": response}
 
 
 def support_assistant(state: State, config: RunnableConfig) -> dict:

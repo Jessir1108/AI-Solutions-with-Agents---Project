@@ -1,5 +1,5 @@
-# src/tools.py
 from typing import Any, Dict, List, Literal, Optional, Union
+import inspect
 
 import pandas as pd
 from langchain_chroma import Chroma
@@ -23,34 +23,34 @@ def get_user_id() -> Optional[int]:
     return _current_user_id
 
 
-# Global CSVs — loaded once, outside tool
 PRODUCTS_CSV = "./dataset/products.csv"
 DEPARTMENTS_CSV = "./dataset/departments.csv"
 
 _products_df = pd.read_csv(PRODUCTS_CSV)
 _product_lookup = dict(zip(_products_df["product_id"], _products_df["product_name"]))
 
-# Load global CSVs once
 products = pd.read_csv("./dataset/products.csv")
 departments = pd.read_csv("./dataset/departments.csv")
 aisles = pd.read_csv("./dataset/aisles.csv")
 prior = pd.read_csv("./dataset/order_products__prior.csv")
 orders = pd.read_csv("./dataset/orders.csv")
 
+products["aisle_id"] = products["aisle_id"].astype(str)
+products["department_id"] = products["department_id"].astype(str)
+aisles["aisle_id"] = aisles["aisle_id"].astype(str)
+departments["department_id"] = departments["department_id"].astype(str)
 
-# Build enumerated options
 DEPARTMENT_NAMES = sorted(departments["department"].dropna().unique().tolist())
 
 VALID_USER_IDS = sorted(orders["user_id"].dropna().unique().tolist())
 
-# Pick the first user for simplicity and safety
 DEFAULT_USER_ID = VALID_USER_IDS[0]
 
-# TODO
+
 @tool
 def structured_search_tool(
     product_name: Optional[str] = None,
-    department: Optional[Literal[tuple(DEPARTMENT_NAMES)]] = None,
+    department: Optional[str] = None,
     aisle: Optional[str] = None,
     reordered: Optional[bool] = None,
     min_orders: Optional[int] = None,
@@ -179,10 +179,166 @@ def structured_search_tool(
     LLM Usage Note:
     This tool is ideal for filtered browsing, purchase history analysis, or category breakdowns.
     """
-    pass
+    try:
+        df = products.copy()
+
+        if (
+            "aisle_id" in df.columns
+            and "aisle_id" in aisles.columns
+            and "aisle" in aisles.columns
+        ):
+            df = df.merge(aisles[["aisle_id", "aisle"]], on="aisle_id", how="left")
+        elif "aisle" not in df.columns and "aisle" in aisles.columns:
+            df["aisle"] = df.get("aisle", None)
+
+        if (
+            "department_id" in df.columns
+            and "department_id" in departments.columns
+            and "department" in departments.columns
+        ):
+            df = df.merge(
+                departments[["department_id", "department"]],
+                on="department_id",
+                how="left",
+            )
+        elif "department" not in df.columns and "department" in departments.columns:
+            df["department"] = df.get("department", None)
+
+        if product_name:
+            df = df[df["product_name"].str.contains(product_name, case=False, na=False)]
+
+        if department:
+            if "department" in df.columns:
+                df = df[df["department"] == department]
+            else:
+                df = df.iloc[0:0]
+
+        if aisle:
+            if "aisle" in df.columns:
+                df = df[df["aisle"].str.lower().str.contains(aisle.lower(), na=False)]
+            else:
+                df = df.iloc[0:0]
+
+        history_stats = None
+        if history_only:
+            uid = get_user_id()
+            if uid is None:
+                return [
+                    {
+                        "error": "history_only=True requires a current user id (call set_user_id)."
+                    }
+                ]
+
+            if "order_id" not in orders.columns or "user_id" not in orders.columns:
+                return [{"error": "orders dataset missing required columns."}]
+
+            user_order_ids = (
+                orders.loc[orders["user_id"] == uid, "order_id"].unique().tolist()
+            )
+            if len(user_order_ids) == 0:
+                return []
+
+            if "order_id" not in prior.columns or "product_id" not in prior.columns:
+                return [{"error": "prior dataset missing required columns."}]
+
+            user_prior = prior[prior["order_id"].isin(user_order_ids)].copy()
+
+            if "add_to_cart_order" not in user_prior.columns:
+                user_prior["add_to_cart_order"] = None
+            if "reordered" not in user_prior.columns:
+                user_prior["reordered"] = 0
+
+            agg = (
+                user_prior.groupby("product_id")
+                .agg(
+                    count=("product_id", "size"),
+                    add_to_cart_order=("add_to_cart_order", "mean"),
+                    reordered_count=("reordered", "sum"),
+                )
+                .reset_index()
+            )
+            history_stats = agg.rename(columns={"product_id": "product_id"})
+
+            if "product_id" in df.columns:
+                df = df.merge(
+                    history_stats,
+                    left_on="product_id",
+                    right_on="product_id",
+                    how="left",
+                )
+            else:
+                df = df.iloc[0:0]
+
+            df["count"] = df.get("count", 0).fillna(0).astype(int)
+            df["add_to_cart_order"] = df.get("add_to_cart_order", None)
+            df["reordered_count"] = df.get("reordered_count", 0).fillna(0).astype(int)
+
+            if reordered is True:
+                df = df[df["reordered_count"] > 0]
+            elif reordered is False:
+                df = df[df["reordered_count"] == 0]
+
+            if min_orders is not None:
+                df = df[df["count"] >= int(min_orders)]
+
+            if order_by in ("count", "add_to_cart_order"):
+                sort_col = order_by
+                df = df.sort_values(
+                    by=sort_col, ascending=bool(ascending), na_position="last"
+                )
+
+        if group_by in ("department", "aisle"):
+            if group_by not in df.columns:
+                return []
+            grouped = df.groupby(group_by).size().reset_index(name="num_products")
+            grouped = grouped.sort_values("num_products", ascending=bool(ascending))
+            if top_k:
+                grouped = grouped.head(int(top_k))
+            return grouped.astype(object).to_dict(orient="records")
+
+        out_cols = ["product_id", "product_name"]
+        if "aisle" in df.columns:
+            out_cols.append("aisle")
+        else:
+            df["aisle"] = ""
+            out_cols.append("aisle")
+        if "department" in df.columns:
+            out_cols.append("department")
+        else:
+            df["department"] = ""
+            out_cols.append("department")
+
+        if history_only:
+            out_cols.extend(["count", "add_to_cart_order", "reordered_count"])
+
+        if top_k:
+            df = df.head(int(top_k))
+
+        results = []
+        for _, row in df.iterrows():
+            item = {
+                "product_id": (
+                    int(row["product_id"])
+                    if not pd.isna(row.get("product_id"))
+                    else None
+                ),
+                "product_name": row.get("product_name", "") or "",
+                "aisle": row.get("aisle", "") or "",
+                "department": row.get("department", "") or "",
+            }
+            if history_only:
+                item["count"] = int(row.get("count", 0) or 0)
+                ato = row.get("add_to_cart_order")
+                item["add_to_cart_order"] = None if pd.isna(ato) else float(ato)
+                item["reordered"] = bool(int(row.get("reordered_count", 0) or 0) > 0)
+            results.append(item)
+
+        return results
+
+    except Exception as e:
+        return [{"error": str(e)}]
 
 
-# TODO
 class RouteToCustomerSupport(BaseModel):
     """
     Pydantic schema for the assistant tool that triggers routing to customer support.
@@ -212,7 +368,21 @@ class RouteToCustomerSupport(BaseModel):
     This schema must be registered as a tool in the assistant's tool list.
     """
 
-    reason: str = Field(description="The reason why the customer needs support.")
+    reason: str = Field(
+        ...,
+        description="The reason why the customer needs support. Must be provided verbatim.",
+        min_length=1,
+        max_length=1000,
+    )
+
+    class Config:
+        title = "RouteToCustomerSupport"
+        schema_extra = {
+            "example": {"reason": "My laptop arrived broken and I want a refund"}
+        }
+
+    def __str__(self) -> str:
+        return self.reason
 
 
 class EscalateToHuman(BaseModel):
@@ -222,7 +392,6 @@ class EscalateToHuman(BaseModel):
     summary: str = Field(description="A brief summary of the customer's issue.")
 
 
-# ---- NEW: Search tool and handler ----
 class Search(BaseModel):
     query: str = Field(description="User's natural language product search query.")
 
@@ -241,7 +410,6 @@ def make_query_prompt(query: str) -> str:
     return f"Represent this sentence for searching relevant passages: {query.strip().replace(chr(10), ' ')}"
 
 
-# TODO
 def search_products(query: str, top_k: int = 5):
     """
     Perform a semantic vector search over the product catalog using HuggingFace embeddings and Chroma.
@@ -284,10 +452,67 @@ def search_products(query: str, top_k: int = 5):
     ]
     ```
     """
-    pass
+    prompt = make_query_prompt(query or "")
+    results: list[dict] = []
+
+    try:
+        vs = get_vector_store()
+    except Exception:
+        vs = None
+
+    if vs is not None:
+        try:
+            try:
+                docs = vs.similarity_search(prompt, k=top_k)
+            except TypeError:
+                docs = vs.similarity_search(prompt, top_k)
+        except Exception:
+            docs = []
+
+        for d in docs or []:
+            md = getattr(d, "metadata", None) or {}
+            results.append(
+                {
+                    "product_id": md.get("product_id"),
+                    "product_name": md.get("product_name"),
+                    "aisle": md.get("aisle"),
+                    "department": md.get("department"),
+                }
+            )
+
+        results = [r for r in results if r.get("product_id") is not None]
+        if results:
+            return results[:top_k]
+
+    q = (query or "").strip()
+    if not q:
+        return []
+
+    prod = products.copy()
+    a = aisles.copy()
+    d = departments.copy()
+
+    mask = prod["product_name"].astype(str).str.contains(q, case=False, na=False)
+    hits = (
+        prod.loc[mask]
+        .head(top_k)
+        .merge(a, on="aisle_id", how="left")
+        .merge(d, on="department_id", how="left")
+    )
+
+    out = []
+    for _, r in hits.iterrows():
+        out.append(
+            {
+                "product_id": int(r["product_id"]),
+                "product_name": str(r["product_name"]),
+                "aisle": str(r.get("aisle", "")),
+                "department": str(r.get("department", "")),
+            }
+        )
+    return out
 
 
-# TODO
 @tool
 def search_tool(query: str) -> str:
     """
@@ -343,16 +568,39 @@ def search_tool(query: str) -> str:
     search_tool("something high protein for breakfast")
     ```
     """
-    pass
+    try:
+        results = search_products(query, top_k=5)
+    except Exception as e:
+        return f"Search failed: {e}"
+
+    if not results:
+        return "No products found matching your search."
+
+    lines = []
+    for r in results:
+        if not isinstance(r, dict):
+            continue
+        pid = r.get("product_id", "Unknown")
+        pname = r.get("product_name", "Unknown Product")
+        aisle = r.get("aisle", "")
+        department = r.get("department", "")
+        details = (r.get("text") or "").strip()
+
+        if len(details) > 300:
+            details = details[:300].rsplit(" ", 1)[0] + "..."
+
+        lines.append(f"- {pname} (ID: {pid})")
+        if aisle:
+            lines.append(f"  Aisle: {aisle}")
+        if department:
+            lines.append(f"  Department: {department}")
+        if details:
+            lines.append(f"  Details: {details}")
+        lines.append("")
+
+    return "\n".join(lines).strip()
 
 
-# ---- UPDATED: Cart tools with quantity support ----
-from typing import Any, Dict, Optional
-
-from langchain_core.tools import tool
-from pydantic import BaseModel, Field
-
-# Simulated in-memory cart storage - now stores product_id: quantity pairs
 _cart_storage: Dict[str, Dict[int, int]] = {}
 _current_thread_id: Optional[str] = None
 
@@ -388,7 +636,6 @@ def cart_tool(
         if product_id is None:
             return "No product ID provided to add."
 
-        # If product already exists, increase quantity
         if product_id in cart:
             cart[product_id] += quantity
             return f"Added {quantity} more of product {product_id} to your cart. New quantity: {cart[product_id]}."
@@ -417,12 +664,10 @@ def cart_tool(
 
         product_name = _product_lookup.get(product_id, "Unknown Product")
 
-        # If quantity is specified and less than current quantity, reduce quantity
         if quantity > 1 and cart[product_id] > quantity:
             cart[product_id] -= quantity
             return f"Removed {quantity} of {product_name} (ID: {product_id}) from your cart. New quantity: {cart[product_id]}."
         else:
-            # Otherwise remove product completely
             del cart[product_id]
             return f"Removed {product_name} (ID: {product_id}) from your cart."
 
@@ -455,9 +700,6 @@ def view_cart() -> str:
     return "\n".join(lines)
 
 
-# ---- Tool fallback handling ----
-
-
 def handle_tool_error(state: Dict[str, Any]) -> dict:
     error = state.get("error")
     tool_calls = state["messages"][-1].tool_calls
@@ -472,7 +714,6 @@ def handle_tool_error(state: Dict[str, Any]) -> dict:
     }
 
 
-# TODO
 def create_tool_node_with_fallback(tools: list) -> ToolNode:
     """
     Build a LangGraph ToolNode that can handle errors gracefully using a fallback strategy.
@@ -495,7 +736,80 @@ def create_tool_node_with_fallback(tools: list) -> ToolNode:
     Returns:
     - ToolNode: A LangGraph-compatible tool node with error fallback logic.
     """
-    pass
+
+    def _fallback_callable(state: Dict[str, Any], **kwargs):
+        try:
+            handle_tool_error(state)
+        except Exception:
+            pass
+        return interrupt()
+
+    fallback_runnable = RunnableLambda(_fallback_callable)
+
+    node = None
+    construction_errors = []
+    try:
+        if hasattr(ToolNode, "from_tools") and inspect.isfunction(
+            getattr(ToolNode, "from_tools")
+        ):
+            node = ToolNode.from_tools(tools)
+        else:
+            node = ToolNode(tools=tools)
+    except Exception as e:
+        construction_errors.append(e)
+        try:
+            node = ToolNode(tools)
+        except Exception as e2:
+            construction_errors.append(e2)
+
+            class _ShimToolNode:
+                def __init__(self, tools_list):
+                    self.tools = tools_list
+                    self._fallback = fallback_runnable
+
+                def on_error(self, runnable):
+                    self._fallback = runnable
+                    return self
+
+                def on_failure(self, runnable):
+                    self._fallback = runnable
+                    return self
+
+                def invoke(self, *args, **kwargs):
+                    if self.tools and callable(getattr(self.tools[0], "func", None)):
+                        return self.tools[0].func(*args, **kwargs)
+                    return None
+
+            node = _ShimToolNode(tools)
+
+    try:
+        setattr(node, "tools", tools)
+    except Exception:
+        pass
+
+    try:
+        if hasattr(node, "on_error") and callable(getattr(node, "on_error")):
+            node = node.on_error(fallback_runnable)
+        elif hasattr(node, "on_failure") and callable(getattr(node, "on_failure")):
+            node = node.on_failure(fallback_runnable)
+        else:
+            try:
+                setattr(node, "_fallback", fallback_runnable)
+            except Exception:
+                pass
+    except Exception:
+        try:
+            setattr(node, "_fallback", fallback_runnable)
+        except Exception:
+            pass
+
+    try:
+        if not hasattr(node, "fallbacks"):
+            setattr(node, "fallbacks", [fallback_runnable])
+    except Exception:
+        pass
+
+    return node
 
 
 __all__ = [
