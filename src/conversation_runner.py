@@ -1,17 +1,39 @@
 import asyncio
+import inspect
 from langgraph.types import Command
 
 from .graph import graph
 
 
 async def run_single_turn_async(user_input, thread_id):
-    """Versión asíncrona de run_single_turn"""
     config = {"configurable": {"thread_id": thread_id}}
     input_state = {"messages": [("user", user_input)]}
     print(f"\nUSER: {user_input}")
     try:
-        result = await graph.ainvoke(input_state, config)  # ← Cambio clave
-        snapshot = graph.get_state(config)
+        if hasattr(graph, "ainvoke") and inspect.iscoroutinefunction(graph.ainvoke):
+            result = await graph.ainvoke(input_state, config)
+        elif hasattr(graph, "invoke"):
+            invoke_result = graph.invoke(input_state, config)
+            if inspect.iscoroutine(invoke_result):
+                result = await invoke_result
+            else:
+                result = invoke_result
+        else:
+            result = await graph.ainvoke(input_state, config)
+
+        if hasattr(graph, "get_state"):
+            get_state_method = graph.get_state
+            if inspect.iscoroutinefunction(get_state_method):
+                snapshot = await get_state_method(config)
+            else:
+                snapshot_result = get_state_method(config)
+                if inspect.iscoroutine(snapshot_result):
+                    snapshot = await snapshot_result
+                else:
+                    snapshot = snapshot_result
+        else:
+            snapshot = await graph.aget_state(config)
+
         interrupt_info = None
         for task in snapshot.tasks:
             if hasattr(task, "interrupts") and task.interrupts:
@@ -54,16 +76,38 @@ async def run_single_turn_async(user_input, thread_id):
 
 
 def run_single_turn(user_input, thread_id):
-    """Wrapper síncrono para compatibilidad con tests y CLI"""
     return asyncio.run(run_single_turn_async(user_input, thread_id))
 
 
 async def resume_with_approval_async(thread_id, supervisor_response):
-    """Versión asíncrona de resume_with_approval"""
     config = {"configurable": {"thread_id": thread_id}}
     try:
-        result = await graph.ainvoke(Command(resume=supervisor_response), config)
-        snapshot = graph.get_state(config)
+        command = Command(resume=supervisor_response)
+
+        if hasattr(graph, "ainvoke") and inspect.iscoroutinefunction(graph.ainvoke):
+            result = await graph.ainvoke(command, config)
+        elif hasattr(graph, "invoke"):
+            invoke_result = graph.invoke(command, config)
+            if inspect.iscoroutine(invoke_result):
+                result = await invoke_result
+            else:
+                result = invoke_result
+        else:
+            result = await graph.ainvoke(command, config)
+
+        if hasattr(graph, "get_state"):
+            get_state_method = graph.get_state
+            if inspect.iscoroutinefunction(get_state_method):
+                snapshot = await get_state_method(config)
+            else:
+                snapshot_result = get_state_method(config)
+                if inspect.iscoroutine(snapshot_result):
+                    snapshot = await snapshot_result
+                else:
+                    snapshot = snapshot_result
+        else:
+            snapshot = await graph.aget_state(config)
+
         state = snapshot.values
         dialog_state = state.get("dialog_state", [])
         current_mode = dialog_state[-1] if dialog_state else "sales_rep"
@@ -94,7 +138,6 @@ async def resume_with_approval_async(thread_id, supervisor_response):
 
 
 def resume_with_approval(thread_id, supervisor_response):
-    """Wrapper síncrono para compatibilidad"""
     return asyncio.run(resume_with_approval_async(thread_id, supervisor_response))
 
 
